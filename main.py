@@ -102,7 +102,8 @@ async def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depend
             token, 
             verification_key, 
             algorithms=[token_alg],
-            audience="authenticated"
+            audience="authenticated",
+            leeway=60
         )
         
         user_id: str = payload.get("sub")
