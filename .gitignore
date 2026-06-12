@@ -1,0 +1,12 @@
+# Hidden credentials file
+.env
+
+# Python temporary files
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
