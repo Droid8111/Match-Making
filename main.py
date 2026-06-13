@@ -2,6 +2,7 @@ import json
 import uuid
 import jwt
 import base64
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -68,6 +69,24 @@ class MatchResponse(BaseModel):
     bio: Optional[str]
     photos: List[str]
     prompts: List[dict]
+
+# --- PYDANTIC SCHEMAS FOR SCHEDULING LOGIC ---
+class ScheduleProposalRequest(BaseModel):
+    match_id: uuid.UUID
+    google_place_id: str = Field(..., max_length=255)
+    name: str = Field(..., max_length=255)
+    address: str
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
+    scheduled_time: datetime
+
+class ScheduleResponse(BaseModel):
+    status: str
+    is_confirmed: bool
+    scheduled_time: datetime
+    tracking_start: datetime
+    tracking_end: datetime
+    message: str
 
 # --- STEP 3: HYBRID AUTHENTICATION DEPENDENCY ---
 async def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
@@ -209,46 +228,193 @@ async def update_preferences(prefs: PreferenceUpdate, user_id: str = Depends(get
     await database.execute(query=query, values={"user_id": user_id, **prefs.dict()})
     return {"status": "success", "message": "Preferences updated successfully."}
 
+@app.post("/users/me/match/schedule", response_model=ScheduleResponse)
+async def upsert_match_schedule(
+    payload: ScheduleProposalRequest, 
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Processes match scheduling proposals, explicit confirmations, and dynamic route adjustments.
+    Outputs strict ring-fenced time boundaries to control client background GPS power loops.
+    """
+    # 1. Verification Wall: Ensure target match exists and is active
+    match_query = """
+        SELECT id, user_one_id, user_two_id 
+        FROM public.matches 
+        WHERE id = CAST(:match_id AS UUID) AND status = 'paired';
+    """
+    match_rec = await database.fetch_one(query=match_query, values={"match_id": str(payload.match_id)})
+    if not match_rec:
+        raise HTTPException(status_code=404, detail="Active match session not found.")
+    
+    is_user_one = str(match_rec["user_one_id"]) == str(user_id)
+    is_user_two = str(match_rec["user_two_id"]) == str(user_id)
+    
+    if not (is_user_one or is_user_two):
+        raise HTTPException(status_code=403, detail="Unauthorized: You are not a participant in this match.")
+
+    # 2. Dynamic Venue Execution: Cache or write Google Places values using PostGIS coordinates
+    venue_query = "SELECT id FROM public.venues WHERE google_place_id = :google_place_id LIMIT 1;"
+    venue_rec = await database.fetch_one(query=venue_query, values={"google_place_id": payload.google_place_id})
+    
+    if venue_rec:
+        venue_uuid = venue_rec["id"]
+    else:
+        insert_venue_query = """
+            INSERT INTO public.venues (google_place_id, name, address, location)
+            VALUES (:google_place_id, :name, :address, ST_SetSRID(ST_MakePoint(:lng, :lat), 4326))
+            RETURNING id;
+        """
+        venue_uuid = await database.execute(
+            query=insert_venue_query,
+            values={
+                "google_place_id": payload.google_place_id,
+                "name": payload.name,
+                "address": payload.address,
+                "lng": payload.longitude,
+                "lat": payload.latitude
+            }
+        )
+
+    # 3. Decision Matrix: Evaluate proposals vs confirmations
+    sched_query = """
+        SELECT id, venue_id, scheduled_time, user_one_agreed, user_two_agreed 
+        FROM public.scheduled_dates 
+        WHERE match_id = CAST(:match_id AS UUID) LIMIT 1;
+    """
+    sched_rec = await database.fetch_one(query=sched_query, values={"match_id": str(payload.match_id)})
+    
+    u1_status = True if is_user_one else False
+    u2_status = True if is_user_two else False
+    current_status = "proposed"
+    
+    if sched_rec:
+        same_time = sched_rec["scheduled_time"] == payload.scheduled_time
+        same_venue = sched_rec["venue_id"] == venue_uuid
+        
+        if same_time and same_venue:
+            # User is confirming the counter-party's open proposal
+            u1_status = True if is_user_one else sched_rec["user_one_agreed"]
+            u2_status = True if is_user_two else sched_rec["user_two_agreed"]
+        else:
+            # User altered the details. Resets agreement flags, forcing a re-verify sequence.
+            u1_status = True if is_user_one else False
+            u2_status = True if is_user_two else False
+            
+        if u1_status and u2_status:
+            current_status = "confirmed"
+            
+        update_query = """
+            UPDATE public.scheduled_dates
+            SET venue_id = CAST(:venue_id AS UUID),
+                scheduled_time = :scheduled_time,
+                user_one_agreed = :u1,
+                user_two_agreed = :u2,
+                status = :status,
+                updated_at = NOW()
+            WHERE id = CAST(:id AS UUID);
+        """
+        await database.execute(
+            query=update_query,
+            values={
+                "id": str(sched_rec["id"]), "venue_id": str(venue_uuid),
+                "scheduled_time": payload.scheduled_time, "u1": u1_status, "u2": u2_status, "status": current_status
+            }
+        )
+    else:
+        # Initial proposal declaration
+        insert_sched_query = """
+            INSERT INTO public.scheduled_dates (match_id, venue_id, scheduled_time, user_one_agreed, user_two_agreed, status)
+            VALUES (CAST(:match_id AS UUID), CAST(:venue_id AS UUID), :scheduled_time, :u1, :u2, :status);
+        """
+        await database.execute(
+            query=insert_sched_query,
+            values={
+                "match_id": str(payload.match_id), "venue_id": str(venue_uuid),
+                "scheduled_time": payload.scheduled_time, "u1": u1_status, "u2": u2_status, "status": current_status
+            }
+        )
+
+    # 4. Compute Dynamic Verification Windows
+    is_confirmed = current_status == "confirmed"
+    tracking_start = payload.scheduled_time - timedelta(minutes=30)
+    tracking_end = payload.scheduled_time + timedelta(minutes=30)
+    
+    msg = "Date locked in! Background tracking window generated." if is_confirmed else "Proposal logged. Waiting for match confirmation."
+
+    return ScheduleResponse(
+        status=current_status,
+        is_confirmed=is_confirmed,
+        scheduled_time=payload.scheduled_time,
+        tracking_start=tracking_start,
+        tracking_end=tracking_end,
+        message=msg
+    )
+
 
 # --- BACKGROUND BATCH ENGINE ---
 
 async def execute_batch_matching(round_id: uuid.UUID):
-    # Notice that round_id is typed strictly as a UUID object here too
+    """
+    Highly optimized batch-matching algorithm. Evaluates localized candidate pools
+    using multi-gender array overlap metrics and indexed age calculations.
+    """
     matching_query = """
-        SELECT p1.user_id AS u1, p2.user_id AS u2
-        FROM profiles p1
-        JOIN users u1 ON p1.user_id = u1.id
-        JOIN dating_preferences pref1 ON p1.user_id = pref1.user_id
-        JOIN profiles p2 ON p1.user_id < p2.user_id
-        JOIN users u2 ON p2.user_id = u2.id
-        JOIN dating_preferences pref2 ON p2.user_id = pref2.user_id
-        WHERE u1.account_status = 'active' AND u2.account_status = 'active'
-          AND (p1.preference_gender = p2.gender OR p1.preference_gender = 'everyone')
-          AND (p2.preference_gender = p1.gender OR p2.preference_gender = 'everyone')
-          AND EXTRACT(YEAR FROM AGE(p2.birth_date)) BETWEEN pref1.min_age AND pref1.max_age
-          AND EXTRACT(YEAR FROM AGE(p1.birth_date)) BETWEEN pref2.min_age AND pref2.max_age
-          AND ST_DWithin(p1.location, p2.location, pref1.max_distance_km * 1000, true)
-          AND ST_DWithin(p2.location, p1.location, pref2.max_distance_km * 1000, true);
+    SELECT 
+        p1.user_id AS user_one_id, 
+        p2.user_id AS user_two_id
+    FROM public.profiles p1
+    JOIN public.users u1 ON p1.user_id = u1.id
+    JOIN public.dating_preferences pref1 ON p1.user_id = pref1.user_id
+
+    JOIN public.profiles p2 ON p1.user_id < p2.user_id
+    JOIN public.users u2 ON p2.user_id = u2.id
+    JOIN public.dating_preferences pref2 ON p2.user_id = pref2.user_id
+
+    WHERE 
+        u1.account_status = 'active' 
+        AND u2.account_status = 'active'
+        
+        -- 1. INCLUSIVE MUTUAL GENDER ATTRACTIVITY OVERLAP
+        AND pref1.preference_genders && ARRAY[p2.gender]::VARCHAR[]
+        AND pref2.preference_genders && ARRAY[p1.gender]::VARCHAR[]
+        
+        -- 2. MUTUAL AGE BRACKET VALIDATION (OPTIMIZED USING COALESCED CORES)
+        AND p2.calculated_age BETWEEN pref1.min_age AND pref1.max_age
+        AND p1.calculated_age BETWEEN pref2.min_age AND pref2.max_age
+        
+        -- 3. MUTUAL POSTGIS GEOSPATIAL DISTANCE THRESHOLDS
+        AND ST_DWithin(p1.location, p2.location, pref1.max_distance_km * 1000, true)
+        AND ST_DWithin(p2.location, p1.location, pref2.max_distance_km * 1000, true);
     """
     potential_pairs = await database.fetch_all(query=matching_query)
     assigned_users = set()
     insert_pairs = []
 
     for pair in potential_pairs:
-        u1, u2 = pair["u1"], pair["u2"]
+        u1 = pair["user_one_id"]
+        u2 = pair["user_two_id"]
+        
         if u1 not in assigned_users and u2 not in assigned_users:
             assigned_users.add(u1)
             assigned_users.add(u2)
-            insert_pairs.append({"round_id": str(round_id), "user_one_id": u1, "user_two_id": u2})
+            insert_pairs.append({
+                "round_id": str(round_id), 
+                "user_one_id": str(u1), 
+                "user_two_id": str(u2)
+            })
 
     if insert_pairs:
         insert_query = """
-            INSERT INTO matches (round_id, user_one_id, user_two_id, status)
+            INSERT INTO public.matches (round_id, user_one_id, user_two_id, status)
             VALUES (:round_id, :user_one_id, :user_two_id, 'paired');
         """
         await database.execute_many(query=insert_query, values=insert_pairs)
     
-    await database.execute("UPDATE rounds SET status = 'active' WHERE id = :round_id", {"round_id": str(round_id)})
+    await database.execute(
+        "UPDATE public.rounds SET status = 'active' WHERE id = :round_id", 
+        {"round_id": str(round_id)}
+    )
     print(f"Batch processing completed safely for Round: {round_id}")
 
 
