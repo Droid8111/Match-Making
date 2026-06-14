@@ -3,7 +3,7 @@ import uuid
 import jwt
 import base64
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Query
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -11,6 +11,7 @@ from typing import List, Optional
 import databases
 import os
 from dotenv import load_dotenv
+from qa_dashboard import dashboard_router as qa_router
 
 load_dotenv()
 
@@ -49,6 +50,7 @@ LEGACY_HS256_KEY = get_legacy_hs256_key(RAW_JWT_SECRET)
 
 security = HTTPBearer()
 app = FastAPI(title="Round-Based Dating API")
+app.include_router(qa_router)
 
 @app.on_event("startup")
 async def startup():
@@ -71,6 +73,12 @@ class MatchResponse(BaseModel):
     bio: Optional[str]
     photos: List[str]
     prompts: List[dict]
+    
+class ProfileSetupRequest(BaseModel):
+    first_name: str
+    birth_date: str  # Format: YYYY-MM-DD
+    gender: str
+    preference_genders: List[str]
 
 # --- PYDANTIC SCHEMAS FOR SCHEDULING LOGIC ---
 class ScheduleProposalRequest(BaseModel):
@@ -108,6 +116,13 @@ class AffirmationRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     match_id: uuid.UUID
     message_text: str
+
+# --- QA ENDPOINT SCHEMA IMPORTS ---
+class AdminRoundRequest(BaseModel):
+    pass # Empty object for triggering post actions
+
+class QALocationUpdate(BaseModel):
+    preset_name: str
 
 # --- STEP 3: HYBRID AUTHENTICATION DEPENDENCY ---
 async def get_current_user_id(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
@@ -237,6 +252,40 @@ async def get_current_match(user_id: str = Depends(get_current_user_id)):
         match_id=str(match_record["match_row_id"]), first_name=profile_record["first_name"], age=profile_record["age"],
         bio=profile_record["bio"], photos=photos_list, prompts=prompts_list
     )
+
+@app.post("/users/me/profile-setup", status_code=200)
+async def setup_user_profile(payload: ProfileSetupRequest, user_id: str = Depends(get_current_user_id)):
+    """
+    Initializes user demographics, calculates exact age, and sets array preferences.
+    Explicitly casts the birth date placeholder to prevent PostgreSQL parameter ambiguity.
+    """
+    # Parse the incoming string into a native Python date object for asyncpg
+    parsed_birth_date = datetime.strptime(payload.birth_date, "%Y-%m-%d").date()
+    
+    # FIXED: Added explicit CAST(:birth_date AS DATE) inside the AGE() function context
+    prof_query = """
+        UPDATE public.profiles 
+        SET first_name = :first_name, 
+            gender = :gender, 
+            birth_date = CAST(:birth_date AS DATE),
+            calculated_age = EXTRACT(YEAR FROM AGE(CAST(:birth_date AS DATE)))::int,
+            updated_at = NOW()
+        WHERE user_id = CAST(:user_id AS UUID);
+    """
+    await database.execute(prof_query, values={
+        "first_name": payload.first_name, 
+        "gender": payload.gender,
+        "birth_date": parsed_birth_date, 
+        "user_id": user_id
+    })
+
+    pref_query = """
+        INSERT INTO public.dating_preferences (user_id, preference_genders)
+        VALUES (CAST(:user_id AS UUID), :pref_genders)
+        ON CONFLICT (user_id) DO UPDATE SET preference_genders = EXCLUDED.preference_genders;
+    """
+    await database.execute(pref_query, values={"user_id": user_id, "pref_genders": payload.preference_genders})
+    return {"status": "success", "message": "Profile initialized."}
 
 @app.put("/users/me/preferences", status_code=200)
 async def update_preferences(prefs: PreferenceUpdate, user_id: str = Depends(get_current_user_id)):
@@ -373,7 +422,7 @@ async def upsert_match_schedule(
     )
 
 # ==========================================
-# 1. VOLUNTARY ROUND OPT-IN MECHANIC
+# VOLUNTARY ROUND OPT-IN MECHANIC
 # ==========================================
 @app.put("/users/me/opt-in", status_code=200)
 async def toggle_round_opt_in(payload: OptInRequest, user_id: str = Depends(get_current_user_id)):
@@ -390,7 +439,7 @@ async def toggle_round_opt_in(payload: OptInRequest, user_id: str = Depends(get_
     return {"status": "success", "message": status_msg}
 
 # ==========================================
-# 2. DYNAMIC CHAT ROOM GUARDRAIL WITH TIMER
+# DYNAMIC CHAT ROOM GUARDRAIL WITH TIMER
 # ==========================================
 @app.post("/users/me/messages/send", status_code=201)
 async def send_chat_message(payload: SendMessageRequest, user_id: str = Depends(get_current_user_id)):
@@ -429,7 +478,34 @@ async def send_chat_message(payload: SendMessageRequest, user_id: str = Depends(
     return {"status": "sent"}
 
 # ==========================================
-# 3. TELEMETRY INGEST WINDOW REGULATOR
+# NEW REAL-TIME CHAT FETCHING ROUTE
+# ==========================================
+@app.get("/users/me/messages")
+async def fetch_chat_history(match_id: str = Query(...), user_id: str = Depends(get_current_user_id)):
+    """Fetches chat logs. Simulator will poll this every 3 seconds."""
+    
+    # Security: Verify relationship and check if round is still active
+    auth_query = """
+        SELECT r.status FROM public.matches m
+        JOIN public.rounds r ON m.round_id = r.id
+        WHERE m.id = CAST(:match_id AS UUID) 
+          AND (m.user_one_id = CAST(:user_id AS UUID) OR m.user_two_id = CAST(:user_id AS UUID))
+    """
+    auth_rec = await database.fetch_one(auth_query, values={"match_id": match_id, "user_id": user_id})
+    if not auth_rec or auth_rec["status"] != "active":
+        raise HTTPException(status_code=403, detail="Chat channel is closed or unauthorized.")
+
+    msg_query = """
+        SELECT sender_id, message_text, created_at 
+        FROM public.chat_messages 
+        WHERE match_id = CAST(:match_id AS UUID)
+        ORDER BY created_at ASC;
+    """
+    messages = await database.fetch_all(msg_query, values={"match_id": match_id})
+    return [{"sender_id": str(m["sender_id"]), "text": m["message_text"], "time": str(m["created_at"])} for m in messages]
+
+# ==========================================
+# TELEMETRY INGEST WINDOW REGULATOR
 # ==========================================
 @app.post("/users/me/location/ping", status_code=202)
 async def ingest_device_telemetry(payload: LocationPingRequest, user_id: str = Depends(get_current_user_id)):
@@ -676,340 +752,114 @@ async def trigger_round_matching(
     return {"status": "processing", "message": "Match calculation engine started safely."}
 
 
-@app.get("/qa/dashboard", response_class=HTMLResponse)
-async def render_qa_dashboard():
+@app.post("/admin/macro/execute-matching", status_code=200)
+async def admin_execute_matching(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Macro Admin Action: Executes the full PostGIS batching engine."""
+    await verify_admin_access(credentials)
+    
+    active_round = await database.fetch_one("SELECT id FROM public.rounds WHERE status = 'active' LIMIT 1;")
+    if not active_round:
+        raise HTTPException(status_code=400, detail="No active round configuration found.")
+        
+    round_id = active_round["id"]
+    
+    # -------------------------------------------------------------
+    # THE PRODUCTION MATCHING QUERY (Fixed Array Casting Syntax)
+    # -------------------------------------------------------------
+    match_algo_query = """
+        WITH available_singles AS (
+            SELECT p.user_id, p.gender, p.calculated_age, p.location, pref.preference_genders, pref.min_age, pref.max_age, pref.max_distance_km
+            FROM public.profiles p
+            JOIN public.users u ON p.user_id = u.id
+            JOIN public.dating_preferences pref ON p.user_id = pref.user_id
+            WHERE p.is_searching = TRUE AND u.account_status = 'active'
+        ),
+        valid_pairs AS (
+            SELECT 
+                LEAST(u1.user_id, u2.user_id) AS user_one, 
+                GREATEST(u1.user_id, u2.user_id) AS user_two
+            FROM available_singles u1
+            JOIN available_singles u2 ON u1.user_id < u2.user_id
+            WHERE 
+                -- 1. Spatial Constraints
+                ST_DWithin(u1.location, u2.location, u1.max_distance_km * 1000, true)
+                AND ST_DWithin(u2.location, u1.location, u2.max_distance_km * 1000, true)
+                -- 2. Gender Inclusivity Checks (Casting Fix Applied)
+                AND u1.preference_genders && ARRAY[u2.gender::varchar]
+                AND u2.preference_genders && ARRAY[u1.gender::varchar]
+                -- 3. Blocklist Elimination Check
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.match_blocklist bl 
+                    WHERE bl.user_one_id = LEAST(u1.user_id, u2.user_id) 
+                      AND bl.user_two_id = GREATEST(u1.user_id, u2.user_id)
+                )
+        )
+        INSERT INTO public.matches (round_id, user_one_id, user_two_id, status)
+        SELECT CAST(:round_id AS UUID), user_one, user_two, 'paired' FROM valid_pairs
+        ON CONFLICT DO NOTHING;
     """
-    Renders an interactive, visual HTML/JS debugging dashboard to perform
-    live end-to-end user lifecycles, GPS spoofing, and referee validations.
+    await database.execute(match_algo_query, values={"round_id": str(round_id)})
+    return {"status": "success", "message": "Batch geospatial matching cycle completed successfully."}
+
+@app.put("/qa/update-location-point", status_code=200)
+async def update_qa_spatial_location(payload: QALocationUpdate, user_id: str = Depends(get_current_user_id)):
+    """Rewrites a user's PostGIS spatial anchor to test geographic boundary limits."""
+    presets = {
+        "toronto": {"lat": 43.6532, "lng": -79.3832},
+        "scarborough": {"lat": 43.7731, "lng": -79.2577},
+        "barrie": {"lat": 44.3894, "lng": -79.6903}
+    }
+    target = presets.get(payload.preset_name.lower())
+    if not target:
+        raise HTTPException(status_code=400, detail="Invalid location preset identifier.")
+        
+    query = """
+        UPDATE public.profiles 
+        SET location = ST_SetSRID(ST_MakePoint(:lng, :lat), 4326), updated_at = NOW()
+        WHERE user_id = CAST(:user_id AS UUID);
     """
-    html_content = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>App Architecture QA Dashboard</title>
-        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-        <style>
-            .log-entry {{ font-family: 'Courier New', Courier, monospace; font-size: 0.85rem; }}
-        </style>
-    </head>
-    <body class="bg-slate-900 text-slate-100 min-h-screen p-6">
-        <div class="max-w-7xl mx-auto space-y-6">
-            
-            <header class="bg-slate-800 p-6 rounded-xl border border-slate-700 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-                <div>
-                    <h1 class="text-2xl font-bold text-emerald-400">System Core QA & Admin Dashboard</h1>
-                    <p class="text-slate-400 text-sm">Visually validate live scheduling state transitions, spatial telemetry, and GPS referee arbitration.</p>
-                </div>
-                <div class="flex flex-wrap items-center gap-3 bg-slate-900/60 p-3 rounded-lg border border-slate-700">
-                    <span class="text-xs font-semibold uppercase text-slate-400">Simulated Identity Switcher:</span>
-                    <button onclick="fastLogin('hamza@testapp.com', 'HamzaPass123!')" class="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 rounded text-xs font-medium transition">Log In as Hamza</button>
-                    <button onclick="fastLogin('sarah@testapp.com', 'SarahPass123!')" class="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 rounded text-xs font-medium transition">Log In as Sarah</button>
-                    <div class="w-full md:w-auto mt-2 md:mt-0">
-                        <input type="text" id="customToken" placeholder="Or manual paste JWT here..." oninput="saveManualToken(this.value)" class="w-full bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs focus:outline-none focus:border-emerald-500 text-slate-300">
-                    </div>
-                </div>
-            </header>
+    await database.execute(query, values={"lng": target["lng"], "lat": target["lat"], "user_id": user_id})
+    return {"status": "success", "message": f"Spatial node anchored to {payload.preset_name}."}
 
-            <section class="bg-slate-800/40 p-3 px-6 rounded-lg border border-slate-800 flex justify-between items-center text-xs text-slate-400">
-                <div><span class="font-bold text-slate-300">Target Supabase App Node:</span> {SUPABASE_PROJECT_ID}.supabase.co</div>
-                <div><span class="font-bold text-slate-300">Session Status:</span> <span id="authBadge" class="text-amber-400 font-semibold">No Token Loaded</span></div>
-            </section>
-
-            <main class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-
-                <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 flex flex-col justify-between">
-                    <div class="space-y-4">
-                        <div class="border-b border-slate-700 pb-2 flex justify-between items-center">
-                            <h2 class="font-bold text-lg text-amber-400">1. Google Places Scheduling</h2>
-                            <span class="text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/20 px-1.5 py-0.5 rounded font-mono">POST</span>
-                        </div>
-                        <div class="space-y-3 text-sm">
-                            <div>
-                                <label class="block text-xs text-slate-400 mb-1">Target Match Session UUID</label>
-                                <input type="text" id="sched_match_id" value="2bb58b5e-ea11-4f72-bce8-5925d9ef6182" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-amber-500 outline-none">
-                            </div>
-                            <div>
-                                <label class="block text-xs text-slate-400 mb-1">Google Place ID Look-up Anchor</label>
-                                <input type="text" id="sched_place_id" value="ChIJ_6t9uS0zK4gRcsN5p_v0MhI" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-amber-500 outline-none">
-                            </div>
-                            <div class="grid grid-cols-2 gap-2">
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Venue Name</label>
-                                    <input type="text" id="sched_name" value="Quantum Coffee" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-amber-500 outline-none">
-                                </div>
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Address Matrix</label>
-                                    <input type="text" id="sched_address" value="460 King St W, Toronto" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-amber-500 outline-none">
-                                </div>
-                            </div>
-                            <div class="grid grid-cols-2 gap-2">
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Latitude Coordinate</label>
-                                    <input type="number" step="any" id="sched_lat" value="43.6452" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-amber-500 outline-none">
-                                </div>
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Longitude Coordinate</label>
-                                    <input type="number" step="any" id="sched_lng" value="-79.3952" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-amber-500 outline-none">
-                                </div>
-                            </div>
-                            <div>
-                                <label class="block text-xs text-slate-400 mb-1">Target Meeting ISO Timestamp (Local Target)</label>
-                                <input type="datetime-local" id="sched_time" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-amber-500 outline-none">
-                            </div>
-                        </div>
-                    </div>
-                    <button onclick="submitSchedule()" class="w-full mt-4 py-2.5 bg-amber-600 hover:bg-amber-500 font-semibold rounded-lg transition text-sm cursor-pointer shadow-lg shadow-amber-900/20">Submit / Accept Proposal</button>
-                </div>
-
-                <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 flex flex-col justify-between">
-                    <div class="space-y-4">
-                        <div class="border-b border-slate-700 pb-2 flex justify-between items-center">
-                            <h2 class="font-bold text-lg text-sky-400">2. Background GPS Spoofer</h2>
-                            <span class="text-[10px] bg-sky-500/10 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded font-mono">POST</span>
-                        </div>
-                        <p class="text-xs text-slate-400">Simulate a hardware device location coordinate log packet transmission directly into our high-frequency tracking pipeline matrix.</p>
-                        <div class="space-y-3 text-sm pt-2">
-                            <div class="grid grid-cols-2 gap-2">
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Spoofed Latitude</label>
-                                    <input type="number" step="any" id="gps_lat" value="43.6453" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-sky-500 outline-none">
-                                </div>
-                                <div>
-                                    <label class="block text-xs text-slate-400 mb-1">Spoofed Longitude</label>
-                                    <input type="number" step="any" id="gps_lng" value="-79.3951" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-sky-500 outline-none">
-                                </div>
-                            </div>
-                            <div>
-                                <label class="block text-xs text-slate-400 mb-1">Horizontal Accuracy Margin (meters)</label>
-                                <input type="number" id="gps_accuracy" value="5.2" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-sky-500 outline-none">
-                                <p class="text-[10px] text-slate-500 mt-1">Referee checks reject telemetry with accuracy margins > 30 meters.</p>
-                            </div>
-                            <div class="bg-slate-900/40 p-3 rounded border border-slate-700/60 space-y-2 mt-2">
-                                <span class="text-[11px] block font-semibold text-slate-300">Quick Testing Presets (Toronto Venue):</span>
-                                <div class="flex gap-2">
-                                    <button onclick="setGPSPreset(43.6452, -79.3952)" class="text-[10px] bg-slate-700 px-2 py-1 rounded hover:bg-slate-600 transition">Inside Geofence (43.6452, -79.3952)</button>
-                                    <button onclick="setGPSPreset(43.6532, -79.3832)" class="text-[10px] bg-red-950/40 text-red-400 border border-red-950/80 px-2 py-1 rounded hover:bg-red-900/30 transition">Outside (Eaton Centre)</button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <button onclick="transmitGPS()" class="w-full mt-4 py-2.5 bg-sky-600 hover:bg-sky-500 font-semibold rounded-lg transition text-sm cursor-pointer shadow-lg shadow-sky-900/20">Transmit GPS Ingest Ping</button>
-                </div>
-
-                <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 flex flex-col justify-between">
-                    <div class="space-y-4">
-                        <div class="border-b border-slate-700 pb-2 flex justify-between items-center">
-                            <h2 class="font-bold text-lg text-emerald-400">3. Post-Date Affirmation Loops</h2>
-                            <span class="text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 px-1.5 py-0.5 rounded font-mono">POST</span>
-                        </div>
-                        <div class="space-y-4 text-sm">
-                            <div>
-                                <label class="block text-xs text-slate-400 mb-1">Target Match Session UUID</label>
-                                <input type="text" id="aff_match_id" value="2bb58b5e-ea11-4f72-bce8-5925d9ef6182" class="w-full bg-slate-900 border border-slate-700 rounded p-2 text-xs focus:ring-1 focus:ring-emerald-500 outline-none">
-                            </div>
-                            
-                            <div>
-                                <label class="block text-xs font-semibold text-slate-300 mb-2">Behavioral Status Choice</label>
-                                <div class="space-y-2 bg-slate-900/50 p-3 rounded border border-slate-700">
-                                    <label class="flex items-center gap-2 text-xs cursor-pointer"><input type="radio" name="status_choice" value="met" checked class="accent-emerald-500"> We Met Up Safely ('met')</label>
-                                    <label class="flex items-center gap-2 text-xs cursor-pointer"><input type="radio" name="status_choice" value="mutually_canceled" class="accent-emerald-500"> Mutually Canceled / Postponed</label>
-                                    <label class="flex items-center gap-2 text-xs cursor-pointer"><input type="radio" name="status_choice" value="other_user_flaked" class="accent-emerald-500 text-rose-500"> Counterparty Ghosted/Flaked me</label>
-                                </div>
-                            </div>
-
-                            <div>
-                                <label class="block text-xs font-semibold text-slate-300 mb-2">Future Intent Selection</label>
-                                <div class="grid grid-cols-2 gap-2">
-                                    <label class="flex flex-col items-center justify-center p-2 bg-slate-900 border border-slate-700 rounded cursor-pointer text-center hover:bg-slate-700/30 transition">
-                                        <input type="radio" name="intent_choice" value="continue" checked class="accent-emerald-500 mb-1">
-                                        <span class="text-xs font-bold text-emerald-400">Continue</span>
-                                        <span class="text-[9px] text-slate-400">Lock Chat & Pair</span>
-                                    </label>
-                                    <label class="flex flex-col items-center justify-center p-2 bg-slate-900 border border-slate-700 rounded cursor-pointer text-center hover:bg-slate-700/30 transition">
-                                        <input type="radio" name="intent_choice" value="re_enter" class="accent-emerald-500 mb-1">
-                                        <span class="text-xs font-bold text-rose-400">Re-enter</span>
-                                        <span class="text-[9px] text-slate-400">Freeze Room & Return Pool</span>
-                                    </label>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <button onclick="submitAffirmation()" class="w-full mt-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 font-semibold rounded-lg transition text-sm cursor-pointer shadow-lg shadow-emerald-900/20">Submit Affirmation State</button>
-                </div>
-
-            </main>
-
-            <footer class="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2 shadow-inner">
-                <div class="flex justify-between items-center border-b border-slate-800 pb-2">
-                    <div class="flex items-center gap-2">
-                        <span class="w-2.5 h-2.5 bg-emerald-500 rounded-full animate-pulse"></span>
-                        <span class="text-xs font-bold uppercase tracking-wider text-slate-300">Real-time Event Logger Feed</span>
-                    </div>
-                    <button onclick="clearConsole()" class="text-[10px] text-slate-500 hover:text-slate-300 transition">Clear Console Logs</button>
-                </div>
-                <div id="consoleLogStream" class="h-64 overflow-y-auto space-y-1.5 p-2 bg-slate-900/40 rounded text-slate-300 font-mono text-xs flex flex-col-reverse">
-                    <div class="text-slate-500 text-center py-12 italic">Awaiting integration interactions... Click an action above to track server payloads.</div>
-                </div>
-            </footer>
-
-        </div>
-
-        <script>
-            // Synchronize datetime-local baseline configuration inputs to right now
-            document.getElementById('sched_time').value = new Date(new Date().getTime() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-
-            // Set background authorization token state visualization rules
-            function updateTokenUI() {{
-                const token = localStorage.getItem('user_token');
-                const badge = document.getElementById('authBadge');
-                if (token) {{
-                    const payload = JSON.parse(atob(token.split('.')[1]));
-                    badge.innerText = `Active Session: ${{payload.email || 'Verified Account'}}`;
-                    badge.className = "text-emerald-400 font-bold";
-                }} else {{
-                    badge.innerText = "No Token Loaded";
-                    badge.className = "text-amber-400 font-semibold";
-                }}
-            }}
-            updateTokenUI();
-
-            function saveManualToken(val) {{
-                if (val.trim()) {{
-                    localStorage.setItem('user_token', val.trim());
-                }} else {{
-                    localStorage.removeItem('user_token');
-                }}
-                updateTokenUI();
-            }}
-
-            function setGPSPreset(lat, lng) {{
-                document.getElementById('gps_lat').value = lat;
-                document.getElementById('gps_lng').value = lng;
-                logEvent('SYSTEM', `GPS fields updated to preset coordinates (${{lat}}, ${{lng}})`);
-            }}
-
-            function clearConsole() {{
-                document.getElementById('consoleLogStream').innerHTML = '<div class="text-slate-500 text-center py-12 italic">Console logs cleared.</div>';
-            }}
-
-            function logEvent(type, message, isError = false) {{
-                const stream = document.getElementById('consoleLogStream');
-                
-                // Clear out splash default text if present
-                if (stream.innerHTML.includes('Awaiting integration interactions')) {{
-                    stream.innerHTML = '';
-                }}
-                
-                const timeStr = new Date().toLocaleTimeString();
-                const colorClass = isError ? 'text-rose-400' : (type === 'SYSTEM' ? 'text-sky-400' : 'text-emerald-400');
-                
-                const logItem = document.createElement('div');
-                logItem.className = "p-1.5 rounded bg-slate-950/50 border-l-2 " + (isError ? "border-rose-500" : "border-emerald-500") + " log-entry";
-                logItem.innerHTML = `<span class="text-slate-500">[${{timeStr}}]</span> <span class="${{colorClass}} font-bold">${{type}}</span>: ${{message}}`;
-                
-                stream.insertBefore(logItem, stream.firstChild);
-            }}
-
-            // CLIENT SIDE PASS THROUGH TO CLOUD SUPABASE SIGN-IN HANDSHAKE
-            async function fastLogin(email, password) {{
-                logEvent('SYSTEM', `Authenticating directly with cloud node for user: ${{email}}...`);
-                try {{
-                    const response = await fetch('https://{SUPABASE_PROJECT_ID}.supabase.co/auth/v1/token?grant_type=password', {{
-                        method: 'POST',
-                        headers: {{
-                            'apikey': '{SUPABASE_ANON_PUBLIC_KEY}',
-                            'Content-Type': 'application/json'
-                        }},
-                        body: JSON.stringify({{ email: email, password: password }})
-                    }});
-                    
-                    const data = await response.json();
-                    if (response.ok && data.access_token) {{
-                        localStorage.setItem('user_token', data.access_token);
-                        document.getElementById('customToken').value = data.access_token;
-                        logEvent('SYSTEM', `Login Success! Extracted and cached JWT Access Signature Token.`);
-                        updateTokenUI();
-                    }} else {{
-                        logEvent('AUTH_ERROR', data.error_description || JSON.stringify(data), true);
-                    }}
-                }} catch (err) {{
-                    logEvent('NETWORK_CRASH', err.message, true);
-                }}
-            }}
-
-            async function secureFetch(url, method, payload) {{
-                const token = localStorage.getItem('user_token');
-                if (!token) {{
-                    logEvent('SECURITY_EXCEPTION', 'Execution Blocked: You must activate a user session profile first.', true);
-                    return;
-                }}
-
-                const headers = {{
-                    'Authorization': 'Bearer ' + token,
-                    'Content-Type': 'application/json'
-                }};
-
-                try {{
-                    const response = await fetch(url, {{
-                        method: method,
-                        headers: headers,
-                        body: payload ? JSON.stringify(payload) : null
-                    }});
-
-                    const text = await response.text();
-                    let formattedBody;
-                    try {{
-                        formattedBody = JSON.stringify(JSON.parse(text), null, 2);
-                    }} catch {{
-                        formattedBody = text;
-                    }}
-
-                    const outputLog = `HTTP ${{response.status}}\\nResponse Body: ${{formattedBody}}`;
-                    logEvent(method + ' ' + url, outputLog, !response.ok);
-                }} catch (err) {{
-                    logEvent('HTTP_CRASH', err.message, true);
-                }}
-            }}
-
-            // OPERATION SUBMISSIONS PIPELINES
-            function submitSchedule() {{
-                const payload = {{
-                    match_id: document.getElementById('sched_match_id').value,
-                    google_place_id: document.getElementById('sched_place_id').value,
-                    name: document.getElementById('sched_name').value,
-                    address: document.getElementById('sched_address').value,
-                    latitude: parseFloat(document.getElementById('sched_lat').value),
-                    longitude: parseFloat(document.getElementById('sched_lng').value),
-                    scheduled_time: new Date(document.getElementById('sched_time').value).toISOString()
-                }};
-                secureFetch('/users/me/match/schedule', 'POST', payload);
-            }}
-
-            function transmitGPS() {{
-                const payload = {{
-                    latitude: parseFloat(document.getElementById('gps_lat').value),
-                    longitude: parseFloat(document.getElementById('gps_lng').value),
-                    horizontal_accuracy_meters: parseFloat(document.getElementById('gps_accuracy').value),
-                    recorded_at: new Date().toISOString()
-                }};
-                secureFetch('/users/me/location/ping', 'POST', payload);
-            }}
-
-            function submitAffirmation() {{
-                const statusRadio = document.querySelector('input[name="status_choice"]:checked');
-                const intentRadio = document.querySelector('input[name="intent_choice"]:checked');
-                
-                const payload = {{
-                    match_id: document.getElementById('aff_match_id').value,
-                    status_choice: statusRadio ? statusRadio.value : '',
-                    intent_choice: intentRadio ? intentRadio.value : ''
-                }};
-                secureFetch('/users/me/match/affirmation', 'POST', payload);
-            }}
-        </script>
-    </body>
-    </html>
+@app.get("/users/me/active-match")
+async def get_active_match_session(user_id: str = Depends(get_current_user_id)):
+    """Allows devices to dynamically discover their match UUID without manual entry."""
+    query = """
+        SELECT m.id, m.user_one_id, m.user_two_id, m.status, r.id AS round_id
+        FROM public.matches m
+        JOIN public.rounds r ON m.round_id = r.id
+        WHERE r.status = 'active'
+          AND m.status IN ('paired', 'locked_in')
+          AND (m.user_one_id = CAST(:user_id AS UUID) OR m.user_two_id = CAST(:user_id AS UUID))
+        LIMIT 1;
     """
-    return HTMLResponse(content=html_content, status_code=200)
+    rec = await database.fetch_one(query, values={"user_id": user_id})
+    if not rec:
+        return {"has_match": False}
+        
+    counterparty_id = rec["user_two_id"] if str(rec["user_one_id"]) == str(user_id) else rec["user_one_id"]
+    
+    # Fetch counterparty reputation metrics
+    rep_query = "SELECT first_name, reputation_score FROM public.profiles WHERE user_id = CAST(:target AS UUID);"
+    cp_rec = await database.fetch_one(rep_query, values={"target": counterparty_id})
+
+    return {
+        "has_match": True,
+        "match_id": str(rec["id"]),
+        "status": rec["status"],
+        "counterparty_name": cp_rec["first_name"],
+        "counterparty_rep": cp_rec["reputation_score"]
+    }
+
+@app.post("/admin/macro/create-round", status_code=201)
+async def admin_create_round(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Macro Admin Action: Closes previous round and generates a fresh Active round vector."""
+    await verify_admin_access(credentials)
+    await database.execute("UPDATE public.rounds SET status = 'completed' WHERE status = 'active';")
+    
+    insert_query = """
+        INSERT INTO public.rounds (status, processing_status, started_at) 
+        VALUES ('active', 'idle', NOW()) RETURNING id;
+    """
+    new_round = await database.fetch_one(insert_query)
+    return {"status": "success", "round_id": str(new_round["id"])}
