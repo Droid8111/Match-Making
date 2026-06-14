@@ -670,11 +670,7 @@ async def execute_gps_referee(match_id: uuid.UUID):
         await database.execute("UPDATE public.matches SET status = 'completed' WHERE id = CAST(:id AS UUID);", {"id": str(match_id)})
         print(f"[REFEREE] Dispute unresolved. Match {match_id} closed as completed.")
 
-
-
-
 # --- BACKGROUND BATCH ENGINE ---
-
 async def execute_batch_matching(round_id: uuid.UUID):
     """
     Highly optimized batch-matching algorithm. Evaluates localized candidate pools
@@ -863,3 +859,234 @@ async def admin_create_round(credentials: HTTPAuthorizationCredentials = Depends
     """
     new_round = await database.fetch_one(insert_query)
     return {"status": "success", "round_id": str(new_round["id"])}
+
+async def execute_automated_gps_referee(match_id: uuid.UUID):
+    """
+    Asynchronous Core Engine Task. Validates physical telemetry against venue locations.
+    Addresses double no-show traps and applies programmatic matching pool penalties.
+    """
+    # 1. Fetch match metadata parameters
+    schedule_query = """
+        SELECT m.user_one_id, m.user_two_id, m.user_one_intent, m.user_two_intent,
+               sd.latitude AS venue_lat, sd.longitude AS venue_lng, sd.scheduled_time
+        FROM public.matches m
+        JOIN public.scheduled_dates sd ON m.id = sd.match_id
+        WHERE m.id = CAST(:match_id AS UUID);
+    """
+    date_ctx = await database.fetch_one(schedule_query, values={"match_id": str(match_id)})
+    if not date_ctx:
+        return
+
+    # Establish evaluation timestamps (-30m to +30m around the date)
+    start_window = date_ctx["scheduled_time"] - timedelta(minutes=30)
+    end_window = date_ctx["scheduled_time"] + timedelta(minutes=30)
+
+    # 2. Dynamic Spatial Table Fallback Query with Strict Axis Mapping (Lng, Lat)
+    check_attendance_query = """
+        SELECT EXISTS (
+            -- Trace high-fidelity historic telemetry timeline logs
+            SELECT 1 FROM public.location_logs
+            WHERE user_id = CAST(:user_id AS UUID)
+              AND recorded_at BETWEEN :start_w AND :end_w
+              AND horizontal_accuracy_meters <= 30.0
+              AND ST_DWithin(
+                  location::geography, 
+                  ST_SetSRID(ST_MakePoint(:v_lng, :v_lat), 4326)::geography, 
+                  100.0
+              )
+            UNION ALL
+            -- Fallback: Check the live snapshot coordinate anchor currently active on the profile
+            SELECT 1 FROM public.profiles
+            WHERE user_id = CAST(:user_id AS UUID)
+              AND ST_DWithin(
+                  location::geography, 
+                  ST_SetSRID(ST_MakePoint(:v_lng, :v_lat), 4326)::geography, 
+                  100.0
+              )
+        ) AS attended;
+    """
+
+    # Collect true geographic attendance states
+    u1_args = {"user_id": str(date_ctx["user_one_id"]), "start_w": start_window, "end_w": end_window, "v_lng": date_ctx["venue_lng"], "v_lat": date_ctx["venue_lat"]}
+    u2_args = {"user_id": str(date_ctx["user_two_id"]), "start_w": start_window, "end_w": end_window, "v_lng": date_ctx["venue_lng"], "v_lat": date_ctx["venue_lat"]}
+    
+    u1_present = (await database.fetch_one(check_attendance_query, values=u1_args))["attended"]
+    u2_present = (await database.fetch_one(check_attendance_query, values=u2_args))["attended"]
+
+    # 3. VERDICT EVALUATION TREE
+    
+    # CASE A: THE DOUBLE NO-SHOW ROOM TRAP RESOLUTION
+    if not u1_present and not u2_present:
+        # Penalize both users by kicking them from the active matching round
+        lockout_query = """
+            UPDATE public.profiles 
+            SET is_searching = FALSE, updated_at = NOW() 
+            WHERE user_id IN (CAST(:u1 AS UUID), CAST(:u2 AS UUID));
+        """
+        await database.execute(lockout_query, {"u1": str(date_ctx["user_one_id"]), "u2": str(date_ctx["user_two_id"])})
+        
+        # Free the session and set status to clear UI deadlocks
+        await database.execute(
+            "UPDATE public.matches SET status = 'mutual_missing_lockout' WHERE id = CAST(:id AS UUID);",
+            {"id": str(match_id)}
+        )
+        return
+
+    # CASE B: SINGLE USER FLAKE ARBITRATION
+    flaker_id = None
+    if u1_present and not u2_present:
+        flaker_id = date_ctx["user_two_id"]
+    elif u2_present and not u1_present:
+        flaker_id = date_ctx["user_one_id"]
+
+    if flaker_id:
+        # Execute penalty: Deduct -15 reputation points and boot from pool
+        penalize_sql = """
+            UPDATE public.profiles 
+            SET reputation_score = GREATEST(0, reputation_score - 15),
+                is_searching = FALSE,
+                updated_at = NOW()
+            WHERE user_id = CAST(:flaker_id AS UUID);
+        """
+        await database.execute(penalize_sql, values={"flaker_id": str(flaker_id)})
+        
+        # Log systemic audit footprint entry
+        await database.execute(
+            """INSERT INTO public.reputation_logs (user_id, match_id, action_type, points_changed) 
+               VALUES (CAST(:u_id AS UUID), CAST(:m_id AS UUID), 'verified_flake_no_show', -15);""",
+            {"u_id": str(flaker_id), "m_id": str(match_id)}
+        )
+
+        await database.execute(
+            "UPDATE public.matches SET status = 'flake_no_show' WHERE id = CAST(:id AS UUID);", 
+            {"id": str(match_id)}
+        )
+        return
+
+    # CASE C: MUTUAL ATTENDANCE VERIFIED
+    if u1_present and u2_present:
+        # Clean processing: evaluate actual written intents to route final status context
+        if date_ctx["user_one_intent"] == 'continue' and date_ctx["user_two_intent"] == 'continue':
+            await database.execute("UPDATE public.matches SET status = 'locked_in' WHERE id = CAST(:id AS UUID);", {"id": str(match_id)})
+        else:
+            await database.execute("UPDATE public.matches SET status = 'completed' WHERE id = CAST(:id AS UUID);", {"id": str(match_id)})
+
+    # Compute proximity checks for both users
+    u1_args = {"user_id": str(date_ctx["user_one_id"]), "start_w": start_window, "end_w": end_window, "v_lng": date_ctx["venue_lng"], "v_lat": date_ctx["venue_lat"]}
+    u2_args = {"user_id": str(date_ctx["user_two_id"]), "start_w": start_window, "end_w": end_window, "v_lng": date_ctx["venue_lng"], "v_lat": date_ctx["venue_lat"]}
+    
+    u1_present = (await database.fetch_one(check_attendance_query, values=u1_args))["attended"]
+    u2_present = (await database.fetch_one(check_attendance_query, values=u2_args))["attended"]
+
+    # 3. Process Behavioral Arbitration Violations
+    flaker_id = None
+    if u1_present and not u2_present:
+        flaker_id = date_ctx["user_two_id"]
+    elif u2_present and not u1_present:
+        flaker_id = date_ctx["user_one_id"]
+
+    if flaker_id:
+        # Penalize: Deduct 15 points, boot from pool (is_searching = FALSE)
+        penalize_query = """
+            UPDATE public.profiles 
+            SET reputation_score = GREATEST(0, reputation_score - 15),
+                is_searching = FALSE,
+                updated_at = NOW()
+            WHERE user_id = CAST(:flaker_id AS UUID);
+        """
+        await database.execute(penalize_query, values={"flaker_id": str(flaker_id)})
+
+        # Update Match Entity status tracking metrics
+        await database.execute(
+            "UPDATE public.matches SET status = 'flake_no_show' WHERE id = CAST(:match_id AS UUID);",
+            {"match_id": str(match_id)}
+        )
+        return {"status": "arbitrated", "verdict": "flake_detected", "penalized_user_id": str(flaker_id)}
+        
+    return {"status": "resolved", "verdict": "mutual_attendance_or_double_missing"}
+
+@app.post("/users/me/match/affirmation", status_code=200)
+async def submit_date_affirmation(
+    payload: AffirmationRequest, 
+    background_tasks: BackgroundTasks, 
+    user_id: str = Depends(get_current_user_id)
+):
+    """
+    Ingests post-date metrics and intent state choice boundaries.
+    Always queues the PostGIS evaluation task once both responses land to verify geometry truth.
+    """
+    if payload.status_choice not in ['met', 'mutually_canceled', 'other_user_flaked']:
+        raise HTTPException(status_code=400, detail="Invalid status reporting parameters.")
+    if payload.intent_choice not in ['continue', 're_enter']:
+        raise HTTPException(status_code=400, detail="Invalid progression intent definition.")
+
+    # 1. Identify current user placement inside the pairing matrix
+    match_query = "SELECT user_one_id, user_two_id FROM public.matches WHERE id = CAST(:match_id AS UUID);"
+    m_rec = await database.fetch_one(query=match_query, values={"match_id": str(payload.match_id)})
+    if not m_rec:
+        raise HTTPException(status_code=404, detail="Target match session record missing.")
+
+    is_u1 = str(m_rec["user_one_id"]) == str(user_id)
+    status_field = "user_one_reported_status" if is_u1 else "user_two_reported_status"
+    intent_field = "user_one_intent" if is_u1 else "user_two_intent"
+
+    # 2. Write verification states directly to PostgreSQL
+    write_feedback_sql = f"""
+        UPDATE public.matches 
+        SET {status_field} = :status_choice, {intent_field} = :intent_choice
+        WHERE id = CAST(:match_id AS UUID)
+        RETURNING user_one_reported_status, user_two_reported_status;
+    """
+    res = await database.fetch_one(
+        query=write_feedback_sql, 
+        values={"status_choice": payload.status_choice, "intent_choice": payload.intent_choice, "match_id": str(payload.match_id)}
+    )
+
+    # 3. ABSOLUTE GEOMETRY TRUTH TRIGGER: If both filled, execute spatial evaluation background task
+    if res["user_one_reported_status"] != 'unreported' and res["user_two_reported_status"] != 'unreported':
+        background_tasks.add_task(execute_automated_gps_referee, payload.match_id)
+        return {
+            "status": "processing_closure", 
+            "detail": "Feedback logged. Session routed to the Automated GPS Referee Engine for spatial validation."
+        }
+
+    return {"status": "received", "detail": "Feedback logged successfully. Awaiting counterparty data packet."}
+
+async def perform_stale_matches_cleanup_sweep():
+    """
+    Scans the database for match sessions where the scheduled meeting concluded 
+    over 24 hours ago, but one or both users failed to submit affirmation data.
+    Forcefully invokes the PostGIS referee loop to resolve the session state.
+    """
+    # Defensive inline imports to completely insulate against circular dependency boot locks
+    from main import database
+    from main import execute_automated_gps_referee
+
+    stale_query = """
+        SELECT m.id AS match_id
+        FROM public.matches m
+        JOIN public.scheduled_dates sd ON m.id = sd.match_id
+        WHERE sd.scheduled_time < NOW() - INTERVAL '24 hours'
+          AND m.status IN ('paired', 'locked_in')
+          AND (m.user_one_reported_status = 'unreported' OR m.user_two_reported_status = 'unreported');
+    """
+    try:
+        stale_records = await database.fetch_all(stale_query)
+        print(f"[CLEANUP sweep] Active. Identified {len(stale_records)} stale match sessions requiring arbitration.")
+        
+        for record in stale_records:
+            match_uuid = record["match_id"]
+            print(f"[CLEANUP sweep] Invoking automated PostGIS referee logic on Match: {match_uuid}")
+            
+            # Execute truth validation loop against available telemetry history logs
+            await execute_automated_gps_referee(match_id=match_uuid)
+            
+        print("[CLEANUP sweep] Completed cleanly.")
+        return {"status": "success", "processed_count": len(stale_records)}
+        
+    except Exception as e:
+        print(f"[CLEANUP sweep] Critical exception encountered during database scan: {str(e)}")
+        return {"status": "error", "detail": str(e)}
+    
+
+    

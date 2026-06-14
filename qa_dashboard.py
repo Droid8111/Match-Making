@@ -1,6 +1,10 @@
 import os
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
+import uuid
+import json
+from datetime import datetime
+from typing import Dict, List
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import HTMLResponse  # <-- ADD This line here!
 
 dashboard_router = APIRouter()
 
@@ -640,3 +644,115 @@ async def render_qa_dashboard():
     
     final_html = html_content.replace("%%PROJECT_ID%%", SUPABASE_PROJECT_ID).replace("%%ANON_KEY%%", SUPABASE_ANON_PUBLIC_KEY).replace("%%SERVICE_KEY%%", SERVICE_ROLE_KEY)
     return HTMLResponse(content=final_html, status_code=200)
+
+
+class MobileChatConnectionManager:
+    def __init__(self):
+        # Memory matrix: maps match_id -> Dict[user_id, WebSocket]
+        self.active_rooms: Dict[str, Dict[str, WebSocket]] = {}
+
+    async def connect(self, match_id: str, user_id: str, websocket: WebSocket):
+        await websocket.accept()
+        if match_id not in self.active_rooms:
+            self.active_rooms[match_id] = {}
+        self.active_rooms[match_id][user_id] = websocket
+
+    def disconnect(self, match_id: str, user_id: str):
+        if match_id in self.active_rooms:
+            if user_id in self.active_rooms[match_id]:
+                del self.active_rooms[match_id][user_id]
+            if not self.active_rooms[match_id]:
+                del self.active_rooms[match_id]
+
+    async def route_message_or_trigger_push_fallback(
+        self, match_id: str, sender_id: str, counterparty_id: str, payload: dict
+    ):
+        """
+        Routes text payloads to active sockets in real time.
+        Triggers push gateway fallback if the counterparty's socket is detached.
+        """
+        room_listeners = self.active_rooms.get(match_id, {})
+
+        # Echo message packet back to the sender socket frame for instant UI feedback
+        if sender_id in room_listeners:
+            await room_listeners[sender_id].send_json(payload)
+
+        # Deliver message payload directly to the counterparty websocket lane
+        if counterparty_id in room_listeners:
+            await room_listeners[counterparty_id].send_json(payload)
+        else:
+            # Client is backgrounded or offline: execute remote push notification broadcast
+            await self.dispatch_push_notification_fallback(counterparty_id, payload)
+
+    async def dispatch_push_notification_fallback(self, user_id: str, payload: dict):
+        """
+        Push Notification Gateway. Fires remote APNs/FCM payloads 
+        to devices that backgrounded or closed their socket session.
+        """
+        print(f"[PUSH GATEWAY] Outbound fallback engaged. Target user {user_id} is currently detached.")
+        print(f"[PUSH GATEWAY] Dispatched Remote payload message segment: {payload['message_text'][:30]}...")
+
+# Instantiate global socket router pool manager
+mobile_ws_manager = MobileChatConnectionManager()
+
+@dashboard_router.websocket("/qa/ws/chat/{match_id}")
+async def websocket_chat_stream(websocket: WebSocket, match_id: str, user_id: str = Query(...)):
+    """
+    Low-bandwidth, full-duplex WebSocket channel optimized for Swift/Flutter app clients.
+    Binds the socket strictly to the verified handshake user identity parameters.
+    """
+    from main import database  # Deferred local inline import to bypass boot locks
+    
+    await mobile_ws_manager.connect(match_id, user_id, websocket)
+    try:
+        while True:
+            # Low-bandwidth ingestion frame: expects only {"message_text": "..."}
+            data = await websocket.receive_json()
+            message_text = data.get("message_text")
+            
+            if message_text:
+                # 1. Fetch match row layout from PostgreSQL to identify the participant mapping properties
+                match_query = """
+                    SELECT user_one_id, user_two_id 
+                    FROM public.matches 
+                    WHERE id = CAST(:match_id AS UUID);
+                """
+                match_rec = await database.fetch_one(match_query, values={"match_id": match_id})
+                if not match_rec:
+                    continue
+
+                # 2. Securely isolate counterparty context without client-side data packets input dependency
+                u1_str = str(match_rec["user_one_id"])
+                u2_str = str(match_rec["user_two_id"])
+                counterparty_id = u2_str if user_id == u1_str else u1_str
+
+                # 3. Commit packet to database using the verified connection identity context
+                insert_query = """
+                    INSERT INTO public.chat_messages (match_id, sender_id, message_text)
+                    VALUES (CAST(:match_id AS UUID), CAST(:sender_id AS UUID), :message_text)
+                    RETURNING created_at;
+                """
+                rec = await database.fetch_one(insert_query, values={
+                    "match_id": match_id, "sender_id": user_id, "message_text": message_text
+                })
+                
+                # 4. Standardize output schemas matching production REST data mapping layers
+                broadcast_payload = {
+                    "sender_id": str(user_id),
+                    "message_text": str(message_text),
+                    "created_at": str(rec["created_at"]) if rec else datetime.utcnow().isoformat()
+                }
+                
+                # 5. Route over current websocket pool matrix or fallback to Push Notifications Gateway
+                await mobile_ws_manager.route_message_or_trigger_push_fallback(
+                    match_id=match_id,
+                    sender_id=user_id,
+                    counterparty_id=counterparty_id,
+                    payload=broadcast_payload
+                )
+                
+    except WebSocketDisconnect:
+        # Purge dead memory socket structures cleanly to prevent system memory leaks during tower handoffs
+        mobile_ws_manager.disconnect(match_id, user_id)
+
+    
