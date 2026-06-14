@@ -71,6 +71,7 @@ def run_integration_test():
     auth_data = login_response.json()
     access_token = auth_data.get("access_token")
     print("[SUCCESS] Login successful! Extracted Supabase Signed Access JWT.")
+    print(f"Access Token: {access_token}")
 
     print("\n--- STEP 3: TESTING PROTECTED LOCAL FASTAPI ROUTE WITH JWT ---")
     # Attach our new token as a Bearer string into our local API request header matrix
