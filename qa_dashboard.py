@@ -108,8 +108,15 @@ async def qa_init_round():
     
     # 1. Archive previous rounds safely
     await database.execute("UPDATE public.rounds SET status = 'completed' WHERE status = 'active';")
-    
-    # 2. FIXED: Explicitly provide both start_time and a 14-day interval end_time to satisfy schema rules
+
+    # 2. Purge stale telemetry from previous test runs.
+    # Without this, old location_logs from a prior "both at venue" scenario bleed into
+    # the next test's referee window — causing both users to appear present regardless
+    # of where the new pings are fired. chat_messages cleared for the same reason.
+    await database.execute("DELETE FROM public.location_logs;")
+    await database.execute("DELETE FROM public.chat_messages;")
+
+    # 3. Insert fresh active round
     new_round = await database.fetch_one("""
         INSERT INTO public.rounds (status, start_time, end_time) 
         VALUES ('active', NOW(), NOW() + INTERVAL '14 days') RETURNING id;
@@ -254,7 +261,8 @@ async def render_qa_dashboard():
 <script>
             const SUPA_URL = "https://%%PROJECT_ID%%.supabase.co";
             const SUPA_KEY = "%%ANON_KEY%%";
-            const ADMIN_KEY = "%%SERVICE_KEY%%";
+            // NOTE: Admin actions are performed server-side via authenticated FastAPI
+            // endpoints. The service role key is NEVER sent to the browser.
 
             const state = {
                 hoursElapsed: 0,
@@ -541,10 +549,29 @@ async def render_qa_dashboard():
 
             async function fireGPS(u, locationType) {
                 if(!state.match.isConfirmed) return;
+
+                // "venue" uses the coords of the ACTUAL scheduled venue stored in state,
+                // so the ping matches whatever place was selected in the map picker.
+                // "home" uses Scarborough (~12 km NE of downtown) — guaranteed outside
+                // the 100 m geofence of every downtown/midtown venue preset.
+                let lat, lng;
+                if (locationType === 'venue') {
+                    const presetRaw = document.getElementById('map_preset').value;
+                    const preset = presetRaw ? JSON.parse(presetRaw) : null;
+                    if (!preset) { console.warn("[GPS] No venue preset selected"); return; }
+                    lat = preset.lat;
+                    lng = preset.lng;
+                } else {
+                    // Scarborough Town Centre — ~12 km from downtown Toronto venues
+                    lat = 43.7764;
+                    lng = -79.2318;
+                }
+
                 const payload = {
-                    latitude: locationType === 'venue' ? 43.6452 : 43.7000,
-                    longitude: locationType === 'venue' ? -79.3952 : -79.4000,
-                    horizontal_accuracy_meters: 10, recorded_at: new Date().toISOString()
+                    latitude: lat,
+                    longitude: lng,
+                    horizontal_accuracy_meters: 10,
+                    recorded_at: new Date().toISOString()
                 };
                 await apiFetch(u, '/users/me/location/ping', 'POST', payload);
                 const ind = document.getElementById(`${u}_gps_indicator`);
@@ -642,7 +669,10 @@ async def render_qa_dashboard():
     </html>
     """
     
-    final_html = html_content.replace("%%PROJECT_ID%%", SUPABASE_PROJECT_ID).replace("%%ANON_KEY%%", SUPABASE_ANON_PUBLIC_KEY).replace("%%SERVICE_KEY%%", SERVICE_ROLE_KEY)
+    # SERVICE_ROLE_KEY is intentionally excluded from this substitution.
+    # It must never be embedded in HTML sent to the browser — all admin operations
+    # go through FastAPI endpoints that authenticate the key server-side.
+    final_html = html_content.replace("%%PROJECT_ID%%", SUPABASE_PROJECT_ID).replace("%%ANON_KEY%%", SUPABASE_ANON_PUBLIC_KEY)
     return HTMLResponse(content=final_html, status_code=200)
 
 
@@ -754,5 +784,3 @@ async def websocket_chat_stream(websocket: WebSocket, match_id: str, user_id: st
     except WebSocketDisconnect:
         # Purge dead memory socket structures cleanly to prevent system memory leaks during tower handoffs
         mobile_ws_manager.disconnect(match_id, user_id)
-
-    

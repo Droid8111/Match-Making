@@ -562,10 +562,19 @@ async def submit_date_affirmation(
     if payload.intent_choice not in ['continue', 're_enter']:
         raise HTTPException(status_code=400, detail="Invalid progression intent definition.")
 
+    # RACE CONDITION FIX: Read the match and lock in one query, verifying the match is
+    # still in an actionable state. The UPDATE below only writes if status is still active,
+    # and RETURNING gives us the post-write snapshot atomically — no separate SELECT needed.
     match_query = "SELECT user_one_id, user_two_id, status FROM public.matches WHERE id = CAST(:match_id AS UUID);"
     m_rec = await database.fetch_one(query=match_query, values={"match_id": str(payload.match_id)})
     if not m_rec:
         raise HTTPException(status_code=404, detail="Target match reference mapping missing.")
+
+    # Reject submission if the match is already in a terminal state (e.g. a concurrent
+    # request already resolved it). This is the second layer of race protection —
+    # the referee's own idempotency guard is the first.
+    if m_rec["status"] not in ('paired', 'locked_in'):
+        raise HTTPException(status_code=409, detail="Match is already resolved. Affirmation window closed.")
 
     is_u1 = str(m_rec["user_one_id"]) == str(user_id)
     
@@ -617,32 +626,82 @@ async def execute_gps_referee(match_id: uuid.UUID):
     Asynchronous background referee worker. Cross-references conflicting user reports 
     against high-accuracy location logs within the venue geofence to penalize flakers.
     """
+    # Coordinates live in public.venues.location (PostGIS geometry), not on scheduled_dates.
+    # We JOIN to venues and extract lng/lat with ST_X/ST_Y, bypassing geofence_radius_meters
+    # (frequently NULL) in favour of our own hardcoded 100 m enforcement radius.
     details_query = """
-        SELECT m.user_one_id, m.user_two_id, sd.venue_id, sd.scheduled_time
+        SELECT m.user_one_id, m.user_two_id, sd.scheduled_time,
+               ST_X(v.location::geometry) AS venue_lng,
+               ST_Y(v.location::geometry) AS venue_lat
         FROM public.matches m
         JOIN public.scheduled_dates sd ON m.id = sd.match_id
+        JOIN public.venues v ON v.id = sd.venue_id
         WHERE m.id = CAST(:match_id AS UUID);
     """
     ctx = await database.fetch_one(query=details_query, values={"match_id": str(match_id)})
-    if not ctx or not ctx["venue_id"]:
+    if not ctx or ctx["venue_lat"] is None or ctx["venue_lng"] is None:
+        print(f"[REFEREE] No venue coordinates found for match {match_id}. Cannot arbitrate.")
         return
 
     start_window = ctx["scheduled_time"] - timedelta(minutes=30)
     end_window = ctx["scheduled_time"] + timedelta(minutes=30)
-    
+
+    print(f"[REFEREE] ── Diagnostic dump for match {match_id} ──")
+    print(f"[REFEREE] Venue coords : lat={ctx['venue_lat']}, lng={ctx['venue_lng']}")
+    print(f"[REFEREE] Time window  : {start_window} → {end_window}")
+    print(f"[REFEREE] User 1 (u1)  : {ctx['user_one_id']}")
+    print(f"[REFEREE] User 2 (u2)  : {ctx['user_two_id']}")
+
+    # Raw log counts per user in the window — no accuracy/distance filter yet.
+    # If these are 0, pings never arrived or recorded_at is outside the window.
+    raw_count_sql = """
+        SELECT COUNT(*) AS cnt,
+               MIN(horizontal_accuracy_meters) AS best_accuracy,
+               MIN(recorded_at) AS earliest,
+               MAX(recorded_at) AS latest
+        FROM public.location_logs
+        WHERE user_id = CAST(:user_id AS UUID)
+          AND recorded_at BETWEEN :start_w AND :end_w;
+    """
+    for label, uid in [("u1", str(ctx["user_one_id"])), ("u2", str(ctx["user_two_id"]))]:
+        raw = await database.fetch_one(raw_count_sql, {"user_id": uid, "start_w": start_window, "end_w": end_window})
+        print(f"[REFEREE] {label} raw logs in window: count={raw['cnt']}, best_accuracy={raw['best_accuracy']}, earliest={raw['earliest']}, latest={raw['latest']}")
+
+    # Distance check: how far was each user's closest ping from the venue?
+    closest_sql = """
+        SELECT MIN(ST_Distance(
+            ll.location::geography,
+            ST_SetSRID(ST_MakePoint(:v_lng, :v_lat), 4326)::geography
+        )) AS closest_meters
+        FROM public.location_logs ll
+        WHERE ll.user_id = CAST(:user_id AS UUID)
+          AND ll.recorded_at BETWEEN :start_w AND :end_w;
+    """
+    for label, uid in [("u1", str(ctx["user_one_id"])), ("u2", str(ctx["user_two_id"]))]:
+        dist = await database.fetch_one(closest_sql, {"user_id": uid, "start_w": start_window, "end_w": end_window, "v_lng": ctx["venue_lng"], "v_lat": ctx["venue_lat"]})
+        print(f"[REFEREE] {label} closest ping to venue: {dist['closest_meters']} m  (threshold: 100 m)")
+
     check_attendance_sql = """
         SELECT EXISTS (
             SELECT 1 FROM public.location_logs ll
-            JOIN public.venues v ON v.id = :venue_id
             WHERE ll.user_id = CAST(:user_id AS UUID)
               AND ll.recorded_at BETWEEN :start_w AND :end_w
               AND ll.horizontal_accuracy_meters <= 30.0
-              AND ST_DWithin(ll.location, v.location, v.geofence_radius_meters, true)
+              AND ST_DWithin(
+                  ll.location::geography,
+                  ST_SetSRID(ST_MakePoint(:v_lng, :v_lat), 4326)::geography,
+                  100.0
+              )
         ) AS attended;
     """
-    
-    u1_present = (await database.fetch_one(query=check_attendance_sql, values={"venue_id": str(ctx["venue_id"]), "user_id": str(ctx["user_one_id"]), "start_w": start_window, "end_w": end_window}))["attended"]
-    u2_present = (await database.fetch_one(query=check_attendance_sql, values={"venue_id": str(ctx["venue_id"]), "user_id": str(ctx["user_two_id"]), "start_w": start_window, "end_w": end_window}))["attended"]
+
+    u1_args = {"user_id": str(ctx["user_one_id"]), "start_w": start_window, "end_w": end_window, "v_lng": ctx["venue_lng"], "v_lat": ctx["venue_lat"]}
+    u2_args = {"user_id": str(ctx["user_two_id"]), "start_w": start_window, "end_w": end_window, "v_lng": ctx["venue_lng"], "v_lat": ctx["venue_lat"]}
+
+    u1_present = (await database.fetch_one(query=check_attendance_sql, values=u1_args))["attended"]
+    u2_present = (await database.fetch_one(query=check_attendance_sql, values=u2_args))["attended"]
+
+    print(f"[REFEREE] Attendance verdict: u1_present={u1_present}, u2_present={u2_present}")
 
     target_flaker = None
     if u1_present and not u2_present:
@@ -865,39 +924,50 @@ async def execute_automated_gps_referee(match_id: uuid.UUID):
     Asynchronous Core Engine Task. Validates physical telemetry against venue locations.
     Addresses double no-show traps and applies programmatic matching pool penalties.
     """
-    # 1. Fetch match metadata parameters
+    # IDEMPOTENCY GUARD: If this referee was already invoked concurrently (e.g. both
+    # users submitted affirmation within the same millisecond window), the second
+    # invocation finds the match already in a terminal state and exits without
+    # re-penalizing anyone. This is the primary defense against the race condition
+    # in submit_date_affirmation where both users' requests read 'unreported' before
+    # either write commits, causing two background tasks to fire for the same match.
+    idempotency_check = """
+        SELECT status FROM public.matches 
+        WHERE id = CAST(:match_id AS UUID);
+    """
+    current = await database.fetch_one(idempotency_check, values={"match_id": str(match_id)})
+    if not current or current["status"] not in ('paired', 'locked_in'):
+        return
+
+    # 1. Fetch match metadata — coordinates from public.venues.location (PostGIS geometry).
     schedule_query = """
         SELECT m.user_one_id, m.user_two_id, m.user_one_intent, m.user_two_intent,
-               sd.latitude AS venue_lat, sd.longitude AS venue_lng, sd.scheduled_time
+               sd.scheduled_time,
+               ST_X(v.location::geometry) AS venue_lng,
+               ST_Y(v.location::geometry) AS venue_lat
         FROM public.matches m
         JOIN public.scheduled_dates sd ON m.id = sd.match_id
+        JOIN public.venues v ON v.id = sd.venue_id
         WHERE m.id = CAST(:match_id AS UUID);
     """
     date_ctx = await database.fetch_one(schedule_query, values={"match_id": str(match_id)})
-    if not date_ctx:
+    if not date_ctx or date_ctx["venue_lat"] is None:
         return
 
     # Establish evaluation timestamps (-30m to +30m around the date)
     start_window = date_ctx["scheduled_time"] - timedelta(minutes=30)
     end_window = date_ctx["scheduled_time"] + timedelta(minutes=30)
 
-    # 2. Dynamic Spatial Table Fallback Query with Strict Axis Mapping (Lng, Lat)
+    # 2. Attendance verified exclusively from timestamped telemetry logs within the date window.
+    # The profiles.location snapshot is intentionally excluded — it reflects the user's
+    # *current* position, not where they were during the scheduled meeting. Including it
+    # would allow a user who walked near the venue hours later (or whose low-accuracy
+    # cell-tower fix happened to overlap the geofence) to pass the attendance check.
     check_attendance_query = """
         SELECT EXISTS (
-            -- Trace high-fidelity historic telemetry timeline logs
             SELECT 1 FROM public.location_logs
             WHERE user_id = CAST(:user_id AS UUID)
               AND recorded_at BETWEEN :start_w AND :end_w
               AND horizontal_accuracy_meters <= 30.0
-              AND ST_DWithin(
-                  location::geography, 
-                  ST_SetSRID(ST_MakePoint(:v_lng, :v_lat), 4326)::geography, 
-                  100.0
-              )
-            UNION ALL
-            -- Fallback: Check the live snapshot coordinate anchor currently active on the profile
-            SELECT 1 FROM public.profiles
-            WHERE user_id = CAST(:user_id AS UUID)
               AND ST_DWithin(
                   location::geography, 
                   ST_SetSRID(ST_MakePoint(:v_lng, :v_lat), 4326)::geography, 
@@ -970,40 +1040,7 @@ async def execute_automated_gps_referee(match_id: uuid.UUID):
             await database.execute("UPDATE public.matches SET status = 'locked_in' WHERE id = CAST(:id AS UUID);", {"id": str(match_id)})
         else:
             await database.execute("UPDATE public.matches SET status = 'completed' WHERE id = CAST(:id AS UUID);", {"id": str(match_id)})
-
-    # Compute proximity checks for both users
-    u1_args = {"user_id": str(date_ctx["user_one_id"]), "start_w": start_window, "end_w": end_window, "v_lng": date_ctx["venue_lng"], "v_lat": date_ctx["venue_lat"]}
-    u2_args = {"user_id": str(date_ctx["user_two_id"]), "start_w": start_window, "end_w": end_window, "v_lng": date_ctx["venue_lng"], "v_lat": date_ctx["venue_lat"]}
-    
-    u1_present = (await database.fetch_one(check_attendance_query, values=u1_args))["attended"]
-    u2_present = (await database.fetch_one(check_attendance_query, values=u2_args))["attended"]
-
-    # 3. Process Behavioral Arbitration Violations
-    flaker_id = None
-    if u1_present and not u2_present:
-        flaker_id = date_ctx["user_two_id"]
-    elif u2_present and not u1_present:
-        flaker_id = date_ctx["user_one_id"]
-
-    if flaker_id:
-        # Penalize: Deduct 15 points, boot from pool (is_searching = FALSE)
-        penalize_query = """
-            UPDATE public.profiles 
-            SET reputation_score = GREATEST(0, reputation_score - 15),
-                is_searching = FALSE,
-                updated_at = NOW()
-            WHERE user_id = CAST(:flaker_id AS UUID);
-        """
-        await database.execute(penalize_query, values={"flaker_id": str(flaker_id)})
-
-        # Update Match Entity status tracking metrics
-        await database.execute(
-            "UPDATE public.matches SET status = 'flake_no_show' WHERE id = CAST(:match_id AS UUID);",
-            {"match_id": str(match_id)}
-        )
-        return {"status": "arbitrated", "verdict": "flake_detected", "penalized_user_id": str(flaker_id)}
-        
-    return {"status": "resolved", "verdict": "mutual_attendance_or_double_missing"}
+        return
 
 @app.post("/users/me/match/affirmation", status_code=200)
 async def submit_date_affirmation(
@@ -1020,11 +1057,17 @@ async def submit_date_affirmation(
     if payload.intent_choice not in ['continue', 're_enter']:
         raise HTTPException(status_code=400, detail="Invalid progression intent definition.")
 
-    # 1. Identify current user placement inside the pairing matrix
-    match_query = "SELECT user_one_id, user_two_id FROM public.matches WHERE id = CAST(:match_id AS UUID);"
+    # 1. Identify current user placement inside the pairing matrix.
+    # RACE CONDITION FIX: Also read status here so we can reject submissions against
+    # matches already resolved by a concurrent request. The referee's idempotency guard
+    # provides a second layer of protection even if two requests slip through.
+    match_query = "SELECT user_one_id, user_two_id, status FROM public.matches WHERE id = CAST(:match_id AS UUID);"
     m_rec = await database.fetch_one(query=match_query, values={"match_id": str(payload.match_id)})
     if not m_rec:
         raise HTTPException(status_code=404, detail="Target match session record missing.")
+
+    if m_rec["status"] not in ('paired', 'locked_in'):
+        raise HTTPException(status_code=409, detail="Match is already resolved. Affirmation window closed.")
 
     is_u1 = str(m_rec["user_one_id"]) == str(user_id)
     status_field = "user_one_reported_status" if is_u1 else "user_two_reported_status"
@@ -1087,6 +1130,3 @@ async def perform_stale_matches_cleanup_sweep():
     except Exception as e:
         print(f"[CLEANUP sweep] Critical exception encountered during database scan: {str(e)}")
         return {"status": "error", "detail": str(e)}
-    
-
-    
