@@ -726,14 +726,31 @@ class MobileChatConnectionManager:
 mobile_ws_manager = MobileChatConnectionManager()
 
 @dashboard_router.websocket("/qa/ws/chat/{match_id}")
-async def websocket_chat_stream(websocket: WebSocket, match_id: str, user_id: str = Query(...)):
+async def websocket_chat_stream(websocket: WebSocket, match_id: str, token: str = Query(...), user_id: str = Query(...)):
     """
-    Low-bandwidth, full-duplex WebSocket channel optimized for Swift/Flutter app clients.
-    Binds the socket strictly to the verified handshake user identity parameters.
+    Full-duplex WebSocket channel for Flutter/Swift clients.
+    Identity is verified via JWT on the initial handshake before the socket is accepted.
+    user_id from the query string is ONLY used for routing after the token has confirmed it.
     """
-    from main import database  # Deferred local inline import to bypass boot locks
-    
-    await mobile_ws_manager.connect(match_id, user_id, websocket)
+    from main import database, get_current_user_id  # Deferred to avoid circular import at boot
+    from fastapi.security import HTTPAuthorizationCredentials
+
+    # Verify JWT before accepting the socket. Reject with 1008 (Policy Violation) if invalid.
+    # We manually wrap the token string to reuse the existing get_current_user_id dependency.
+    try:
+        fake_credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        verified_user_id = await get_current_user_id(credentials=fake_credentials)
+    except Exception:
+        await websocket.close(code=1008)  # 1008 = Policy Violation
+        return
+
+    # Reject if the claimed user_id in the query string does not match the token payload.
+    # Prevents a valid user from connecting to another user's socket slot.
+    if verified_user_id != user_id:
+        await websocket.close(code=1008)
+        return
+
+    await mobile_ws_manager.connect(match_id, verified_user_id, websocket)
     try:
         while True:
             # Low-bandwidth ingestion frame: expects only {"message_text": "..."}

@@ -106,7 +106,9 @@ class LocationPingRequest(BaseModel):
     latitude: float = Field(..., ge=-90.0, le=90.0)
     longitude: float = Field(..., ge=-180.0, le=180.0)
     horizontal_accuracy_meters: float = Field(..., ge=0.0)
-    recorded_at: datetime
+    # recorded_at intentionally excluded — server stamps all pings with NOW() on insert.
+    # Accepting client-supplied timestamps would let a user backdate pings into a past
+    # date window and fraudulently pass the GPS referee attendance check.
 
 class AffirmationRequest(BaseModel):
     match_id: uuid.UUID
@@ -533,13 +535,13 @@ async def ingest_device_telemetry(payload: LocationPingRequest, user_id: str = D
 
     log_query = """
         INSERT INTO public.location_logs (user_id, location, horizontal_accuracy_meters, recorded_at)
-        VALUES (CAST(:user_id AS UUID), ST_SetSRID(ST_MakePoint(:lng, :lat), 4326), :accuracy, :recorded_at);
+        VALUES (CAST(:user_id AS UUID), ST_SetSRID(ST_MakePoint(:lng, :lat), 4326), :accuracy, NOW());
     """
     await database.execute(
         query=log_query,
         values={
             "user_id": user_id, "lng": payload.longitude, "lat": payload.latitude,
-            "accuracy": payload.horizontal_accuracy_meters, "recorded_at": payload.recorded_at
+            "accuracy": payload.horizontal_accuracy_meters
         }
     )
     return {"status": "buffered"}
@@ -593,27 +595,34 @@ async def submit_date_affirmation(
     )
 
     if res["user_one_reported_status"] != 'unreported' and res["user_two_reported_status"] != 'unreported':
-        
-        # Conflict Resolution Trigger
-        if res["user_one_reported_status"] != res["user_two_reported_status"]:
-            background_tasks.add_task(execute_gps_referee, payload.match_id)
-            return {"status": "conflict_review", "detail": "Discrepancy identified. Routing to GPS Referee Engine."}
 
-        # Mutual Success Loop: Both want to keep talking and lock connection
-        if res["user_one_reported_status"] == 'met' and res["user_one_intent"] == 'continue' and res["user_two_intent"] == 'continue':
+        u1_status = res["user_one_reported_status"]
+        u2_status = res["user_two_reported_status"]
+
+        # REFEREE TRIGGER: Run GPS arbitration if EITHER user accused the other of flaking.
+        # This covers all accusation cases:
+        #   - One reports flake, other reports met       (classic conflict)
+        #   - Both report other_user_flaked              (both pointing fingers)
+        #   - One reports flake, other reports canceled  (mismatch)
+        # The GPS logs are the ground truth — the referee decides who is right.
+        if 'other_user_flaked' in (u1_status, u2_status):
+            background_tasks.add_task(execute_gps_referee, payload.match_id)
+            return {"status": "conflict_review", "detail": "Flake accusation logged. Routing to GPS Referee Engine for spatial verification."}
+
+        # Both reported met — lock in if both want to continue, otherwise close cleanly
+        if u1_status == 'met' and res["user_one_intent"] == 'continue' and res["user_two_intent"] == 'continue':
             await database.execute(
                 "UPDATE public.matches SET status = 'locked_in' WHERE id = CAST(:id AS UUID);", 
                 {"id": str(payload.match_id)}
             )
             return {"status": "relationship_locked_in", "detail": "Mutual connection confirmed. Skipping next match round."}
-            
-        # Mutual Tear-Down or Partial Opt-out Loop
-        else:
-            await database.execute(
-                "UPDATE public.matches SET status = 'completed' WHERE id = CAST(:id AS UUID);", 
-                {"id": str(payload.match_id)}
-            )
-            return {"status": "pool_returned", "detail": "Match closed. Both users returned to the general active pool."}
+
+        # Mutual cancellation or met-but-not-continuing — close the match cleanly, no penalty
+        await database.execute(
+            "UPDATE public.matches SET status = 'completed' WHERE id = CAST(:id AS UUID);", 
+            {"id": str(payload.match_id)}
+        )
+        return {"status": "pool_returned", "detail": "Match closed. Both users returned to the general active pool."}
 
     return {"status": "received", "detail": "Feedback logged. Awaiting counterparty response."}
 
@@ -1085,13 +1094,33 @@ async def submit_date_affirmation(
         values={"status_choice": payload.status_choice, "intent_choice": payload.intent_choice, "match_id": str(payload.match_id)}
     )
 
-    # 3. ABSOLUTE GEOMETRY TRUTH TRIGGER: If both filled, execute spatial evaluation background task
+    # 3. TRIGGER LOGIC: Run referee if either user accused the other of flaking.
+    # Mutual met/canceled cases resolve directly without needing GPS arbitration.
     if res["user_one_reported_status"] != 'unreported' and res["user_two_reported_status"] != 'unreported':
-        background_tasks.add_task(execute_automated_gps_referee, payload.match_id)
-        return {
-            "status": "processing_closure", 
-            "detail": "Feedback logged. Session routed to the Automated GPS Referee Engine for spatial validation."
-        }
+
+        u1_status = res["user_one_reported_status"]
+        u2_status = res["user_two_reported_status"]
+
+        if 'other_user_flaked' in (u1_status, u2_status):
+            background_tasks.add_task(execute_automated_gps_referee, payload.match_id)
+            return {
+                "status": "processing_closure",
+                "detail": "Flake accusation logged. Session routed to the Automated GPS Referee Engine for spatial validation."
+            }
+
+        # No flake accusation — resolve directly
+        if u1_status == 'met' and u2_status == 'met':
+            await database.execute(
+                "UPDATE public.matches SET status = 'locked_in' WHERE id = CAST(:id AS UUID);",
+                {"id": str(payload.match_id)}
+            )
+            return {"status": "relationship_locked_in", "detail": "Mutual connection confirmed."}
+
+        await database.execute(
+            "UPDATE public.matches SET status = 'completed' WHERE id = CAST(:id AS UUID);",
+            {"id": str(payload.match_id)}
+        )
+        return {"status": "pool_returned", "detail": "Match closed. Both users returned to the general active pool."}
 
     return {"status": "received", "detail": "Feedback logged successfully. Awaiting counterparty data packet."}
 
